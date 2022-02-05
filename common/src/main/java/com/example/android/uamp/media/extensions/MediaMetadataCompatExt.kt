@@ -18,18 +18,17 @@ package com.example.android.uamp.media.extensions
 
 import android.graphics.Bitmap
 import android.net.Uri
+import android.os.Bundle
 import android.support.v4.media.MediaBrowserCompat.MediaItem
-import android.support.v4.media.MediaDescriptionCompat
 import android.support.v4.media.MediaMetadataCompat
-import com.google.android.exoplayer2.source.ConcatenatingMediaSource
-import com.google.android.exoplayer2.source.ExtractorMediaSource
-import com.google.android.exoplayer2.source.ProgressiveMediaSource
-import com.google.android.exoplayer2.upstream.DataSource
+import com.example.android.uamp.media.library.JsonSource
+import com.google.android.exoplayer2.MediaMetadata
+import com.google.android.exoplayer2.util.MimeTypes
 
 /**
  * Useful extensions for [MediaMetadataCompat].
  */
-inline val MediaMetadataCompat.id: String
+inline val MediaMetadataCompat.id: String?
     get() = getString(MediaMetadataCompat.METADATA_KEY_MEDIA_ID)
 
 inline val MediaMetadataCompat.title: String?
@@ -120,7 +119,6 @@ inline val MediaMetadataCompat.downloadStatus
  * Custom property for storing whether a [MediaMetadataCompat] item represents an
  * item that is [MediaItem.FLAG_BROWSABLE] or [MediaItem.FLAG_PLAYABLE].
  */
-@MediaItem.Flags
 inline val MediaMetadataCompat.flag
     get() = this.getLong(METADATA_KEY_UAMP_FLAGS).toInt()
 
@@ -247,7 +245,6 @@ inline var MediaMetadataCompat.Builder.downloadStatus: Long
  * Custom property for storing whether a [MediaMetadataCompat] item represents an
  * item that is [MediaItem.FLAG_BROWSABLE] or [MediaItem.FLAG_PLAYABLE].
  */
-@MediaItem.Flags
 inline var MediaMetadataCompat.Builder.flag: Int
     @Deprecated(NO_GET, level = DeprecationLevel.ERROR)
     get() = throw IllegalAccessException("Cannot get from MediaMetadataCompat.Builder")
@@ -255,41 +252,38 @@ inline var MediaMetadataCompat.Builder.flag: Int
         putLong(METADATA_KEY_UAMP_FLAGS, value.toLong())
     }
 
-/**
- * Custom property for retrieving a [MediaDescriptionCompat] which also includes
- * all of the keys from the [MediaMetadataCompat] object in its extras.
- *
- * These keys are used by the ExoPlayer MediaSession extension when announcing metadata changes.
- */
-inline val MediaMetadataCompat.fullDescription
-    get() =
-        description.also {
-            it.extras?.putAll(bundle)
+fun MediaMetadataCompat.toMediaItemMetadata(): com.google.android.exoplayer2.MediaMetadata {
+    return with(MediaMetadata.Builder()) {
+        setTitle(title)
+        setDisplayTitle(displayTitle)
+        setAlbumArtist(artist)
+        setAlbumTitle(album)
+        setComposer(composer)
+        setTrackNumber(trackNumber.toInt())
+        setTotalTrackCount(trackCount.toInt())
+        setDiscNumber(discNumber.toInt())
+        setWriter(writer)
+        setArtworkUri(albumArtUri)
+        val extras = Bundle()
+        getString(JsonSource.ORIGINAL_ARTWORK_URI_KEY)?.let {
+            // album art is a content:// URI. Keep the original for Cast.
+            extras.putString(
+                JsonSource.ORIGINAL_ARTWORK_URI_KEY,
+                getString(JsonSource.ORIGINAL_ARTWORK_URI_KEY)
+            )
         }
+        extras.putLong(MediaMetadataCompat.METADATA_KEY_DURATION, duration)
+        setExtras(extras)
+    }.build()
+}
 
-/**
- * Extension method for building an [ExtractorMediaSource] from a [MediaMetadataCompat] object.
- *
- * For convenience, place the [MediaDescriptionCompat] into the tag so it can be retrieved later.
- */
-fun MediaMetadataCompat.toMediaSource(dataSourceFactory: DataSource.Factory) =
-        ProgressiveMediaSource.Factory(dataSourceFactory)
-                .setTag(fullDescription)
-                .createMediaSource(mediaUri)
-
-/**
- * Extension method for building a [ConcatenatingMediaSource] given a [List]
- * of [MediaMetadataCompat] objects.
- */
-fun List<MediaMetadataCompat>.toMediaSource(
-        dataSourceFactory: DataSource.Factory
-): ConcatenatingMediaSource {
-
-    val concatenatingMediaSource = ConcatenatingMediaSource()
-    forEach {
-        concatenatingMediaSource.addMediaSource(it.toMediaSource(dataSourceFactory))
-    }
-    return concatenatingMediaSource
+fun MediaMetadataCompat.toMediaItem(): com.google.android.exoplayer2.MediaItem {
+    return with(com.google.android.exoplayer2.MediaItem.Builder()) {
+        setMediaId(mediaUri.toString())
+        setUri(mediaUri)
+        setMimeType(MimeTypes.AUDIO_MPEG)
+        setMediaMetadata(toMediaItemMetadata())
+    }.build()
 }
 
 /**
@@ -297,3 +291,4 @@ fun List<MediaMetadataCompat>.toMediaSource(
  * [MediaItem.FLAG_PLAYABLE].
  */
 const val METADATA_KEY_UAMP_FLAGS = "com.example.android.uamp.media.METADATA_KEY_UAMP_FLAGS"
+

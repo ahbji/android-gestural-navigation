@@ -57,7 +57,7 @@ class NowPlayingFragmentViewModel(
      * media item currently being played.
      */
     data class NowPlayingMetadata(
-        val id: String,
+        val id: String?,
         val albumArtUri: Uri,
         val title: String?,
         val subtitle: String?,

@@ -146,7 +146,7 @@ class MainActivityViewModel(
         }
     }
 
-    fun playMediaId(mediaId: String) {
+    fun playMediaId(mediaId: String?) {
         val nowPlaying = musicServiceConnection.nowPlaying.value
         val transportControls = musicServiceConnection.transportControls
 

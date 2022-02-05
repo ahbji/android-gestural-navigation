@@ -21,6 +21,7 @@ apply plugin: 'kotlin-android-extensions'
 
 android {
     compileSdkVersion rootProject.compileSdkVersion
+
     defaultConfig {
         applicationId "com.example.android.uamp.next"
         versionCode 1
@@ -28,22 +29,26 @@ android {
 
         minSdkVersion rootProject.minSdkVersion
         targetSdkVersion rootProject.targetSdkVersion
+        multiDexEnabled true
 
         compileOptions {
             sourceCompatibility JavaVersion.VERSION_1_8
             targetCompatibility JavaVersion.VERSION_1_8
         }
-
         kotlinOptions {
-            jvmTarget = JavaVersion.VERSION_1_8.toString()
+            jvmTarget = "1.8"
         }
+
         vectorDrawables {
             useSupportLibrary true
         }
     }
-    dataBinding {
-        enabled = true
+
+    buildFeatures {
+        viewBinding true
+        dataBinding true
     }
+
     buildTypes {
         release {
             minifyEnabled false
@@ -53,20 +58,19 @@ android {
 }
 
 dependencies {
+    implementation "com.android.support:multidex:$multidex_version"
+
     implementation project(':common')
 
     implementation "org.jetbrains.kotlin:kotlin-stdlib-jdk8:$kotlin_version"
 
     implementation "androidx.appcompat:appcompat:$androidx_app_compat_version"
+    implementation "androidx.fragment:fragment-ktx:$fragment_version"
     implementation "androidx.recyclerview:recyclerview:$recycler_view_version"
 
     implementation "androidx.constraintlayout:constraintlayout:$constraint_layout_version"
     implementation "androidx.lifecycle:lifecycle-extensions:$arch_lifecycle_version"
-    implementation "androidx.fragment:fragment:1.2.0-rc02"
 
-    implementation "androidx.core:core-ktx:$androidx_core_ktx_version"
-
-    implementation 'com.google.android.material:material:1.1.0'
     // Glide dependencies
     implementation "com.github.bumptech.glide:glide:$glide_version"
     kapt "com.github.bumptech.glide:compiler:$glide_version"

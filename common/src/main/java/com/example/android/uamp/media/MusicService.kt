@@ -16,48 +16,63 @@
 
 package com.example.android.uamp.media
 
+import android.app.Notification
 import android.app.PendingIntent
-import android.app.Service
-import android.content.BroadcastReceiver
-import android.content.Context
+import android.content.ComponentName
 import android.content.Intent
-import android.content.IntentFilter
-import android.media.AudioManager
+import android.content.pm.PackageManager
 import android.net.Uri
-import android.os.Build
 import android.os.Bundle
+import android.os.ResultReceiver
 import android.support.v4.media.MediaBrowserCompat
 import android.support.v4.media.MediaBrowserCompat.MediaItem
 import android.support.v4.media.MediaDescriptionCompat
 import android.support.v4.media.MediaMetadataCompat
-import android.support.v4.media.session.MediaControllerCompat
 import android.support.v4.media.session.MediaSessionCompat
 import android.support.v4.media.session.PlaybackStateCompat
-import androidx.core.app.NotificationManagerCompat
+import android.util.Log
+import android.widget.Toast
 import androidx.core.content.ContextCompat
 import androidx.media.MediaBrowserServiceCompat
+import androidx.media.MediaBrowserServiceCompat.BrowserRoot.EXTRA_RECENT
+import com.example.android.uamp.media.extensions.album
 import com.example.android.uamp.media.extensions.flag
+import com.example.android.uamp.media.extensions.id
+import com.example.android.uamp.media.extensions.toMediaItem
+import com.example.android.uamp.media.extensions.trackNumber
+import com.example.android.uamp.media.library.AbstractMusicSource
 import com.example.android.uamp.media.library.BrowseTree
 import com.example.android.uamp.media.library.JsonSource
 import com.example.android.uamp.media.library.MEDIA_SEARCH_SUPPORTED
 import com.example.android.uamp.media.library.MusicSource
 import com.example.android.uamp.media.library.UAMP_BROWSABLE_ROOT
 import com.example.android.uamp.media.library.UAMP_EMPTY_ROOT
+import com.example.android.uamp.media.library.UAMP_RECENT_ROOT
 import com.google.android.exoplayer2.C
 import com.google.android.exoplayer2.ExoPlayer
-import com.google.android.exoplayer2.ExoPlayerFactory
+import com.google.android.exoplayer2.PlaybackException
 import com.google.android.exoplayer2.Player
-import com.google.android.exoplayer2.Timeline
+import com.google.android.exoplayer2.Player.EVENT_MEDIA_ITEM_TRANSITION
+import com.google.android.exoplayer2.Player.EVENT_PLAY_WHEN_READY_CHANGED
+import com.google.android.exoplayer2.Player.EVENT_POSITION_DISCONTINUITY
+import com.google.android.exoplayer2.Player.EVENT_TIMELINE_CHANGED
+import com.google.android.exoplayer2.SimpleExoPlayer
 import com.google.android.exoplayer2.audio.AudioAttributes
+import com.google.android.exoplayer2.ext.cast.CastPlayer
+import com.google.android.exoplayer2.ext.cast.SessionAvailabilityListener
 import com.google.android.exoplayer2.ext.mediasession.MediaSessionConnector
 import com.google.android.exoplayer2.ext.mediasession.TimelineQueueNavigator
-import com.google.android.exoplayer2.upstream.DefaultDataSourceFactory
+import com.google.android.exoplayer2.ui.PlayerNotificationManager
 import com.google.android.exoplayer2.util.Util
+import com.google.android.exoplayer2.util.Util.constrainValue
+import com.google.android.gms.cast.framework.CastContext
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
+import kotlin.math.max
+import kotlin.math.min
 
 /**
  * This class is the entry point for browsing and playback commands from the APP's UI
@@ -69,20 +84,31 @@ import kotlinx.coroutines.launch
  *
  * For more information on implementing a MediaBrowserService,
  * visit [https://developer.android.com/guide/topics/media-apps/audio-app/building-a-mediabrowserservice.html](https://developer.android.com/guide/topics/media-apps/audio-app/building-a-mediabrowserservice.html).
+ *
+ * This class also handles playback for Cast sessions.
+ * When a Cast session is active, playback commands are passed to a
+ * [CastPlayer](https://exoplayer.dev/doc/reference/com/google/android/exoplayer2/ext/cast/CastPlayer.html),
+ * otherwise they are passed to an ExoPlayer for local playback.
  */
 open class MusicService : MediaBrowserServiceCompat() {
-    private lateinit var becomingNoisyReceiver: BecomingNoisyReceiver
-    private lateinit var notificationManager: NotificationManagerCompat
-    private lateinit var notificationBuilder: NotificationBuilder
+
+    private lateinit var notificationManager: UampNotificationManager
     private lateinit var mediaSource: MusicSource
     private lateinit var packageValidator: PackageValidator
+
+    // The current player will either be an ExoPlayer (for local playback) or a CastPlayer (for
+    // remote playback through a Cast device).
+    private lateinit var currentPlayer: Player
 
     private val serviceJob = SupervisorJob()
     private val serviceScope = CoroutineScope(Dispatchers.Main + serviceJob)
 
     protected lateinit var mediaSession: MediaSessionCompat
-    protected lateinit var mediaController: MediaControllerCompat
     protected lateinit var mediaSessionConnector: MediaSessionConnector
+    private var currentPlaylistItems: List<MediaMetadataCompat> = emptyList()
+    private var currentMediaItemIndex: Int = 0
+
+    private lateinit var storage: PersistentStorage
 
     /**
      * This must be `by lazy` because the source won't initially be ready.
@@ -103,13 +129,38 @@ open class MusicService : MediaBrowserServiceCompat() {
         .setUsage(C.USAGE_MEDIA)
         .build()
 
+    private val playerListener = PlayerEventListener()
+
     /**
      * Configure ExoPlayer to handle audio focus for us.
      * See [Player.AudioComponent.setAudioAttributes] for details.
      */
     private val exoPlayer: ExoPlayer by lazy {
-        ExoPlayerFactory.newSimpleInstance(this).apply {
+        SimpleExoPlayer.Builder(this).build().apply {
             setAudioAttributes(uAmpAudioAttributes, true)
+            setHandleAudioBecomingNoisy(true)
+            addListener(playerListener)
+        }
+    }
+
+    /**
+     * If Cast is available, create a CastPlayer to handle communication with a Cast session.
+     */
+    private val castPlayer: CastPlayer? by lazy {
+        try {
+            val castContext = CastContext.getSharedInstance(this)
+            CastPlayer(castContext, CastMediaItemConverter()).apply {
+                setSessionAvailabilityListener(UampCastSessionAvailabilityListener())
+                addListener(playerListener)
+            }
+        } catch (e : Exception) {
+            // We wouldn't normally catch the generic `Exception` however
+            // calling `CastContext.getSharedInstance` can throw various exceptions, all of which
+            // indicate that Cast is unavailable.
+            // Related internal bug b/68009560.
+            Log.i(TAG, "Cast is not available on this device. " +
+                    "Exception thrown when attempting to obtain CastContext. " + e.message)
+            null
         }
     }
 
@@ -129,7 +180,6 @@ open class MusicService : MediaBrowserServiceCompat() {
                 setSessionActivity(sessionActivityPendingIntent)
                 isActive = true
             }
-
         /**
          * In order for [MediaBrowserCompat.ConnectionCallback.onConnected] to be called,
          * a [MediaSessionCompat.Token] needs to be set on the [MediaBrowserServiceCompat].
@@ -141,63 +191,59 @@ open class MusicService : MediaBrowserServiceCompat() {
          */
         sessionToken = mediaSession.sessionToken
 
-        // Because ExoPlayer will manage the MediaSession, add the service as a callback for
-        // state changes.
-        mediaController = MediaControllerCompat(this, mediaSession).also {
-            it.registerCallback(MediaControllerCallback())
-        }
-
-        notificationBuilder = NotificationBuilder(this)
-        notificationManager = NotificationManagerCompat.from(this)
-
-        becomingNoisyReceiver =
-            BecomingNoisyReceiver(context = this, sessionToken = mediaSession.sessionToken)
+        /**
+         * The notification manager will use our player and media session to decide when to post
+         * notifications. When notifications are posted or removed our listener will be called, this
+         * allows us to promote the service to foreground (required so that we're not killed if
+         * the main UI is not visible).
+         */
+        notificationManager = UampNotificationManager(
+            this,
+            mediaSession.sessionToken,
+            PlayerNotificationListener()
+        )
 
         // The media library is built from a remote JSON file. We'll create the source here,
         // and then use a suspend function to perform the download off the main thread.
-        mediaSource = JsonSource(context = this, source = remoteJsonSource)
+        mediaSource = JsonSource(source = remoteJsonSource)
         serviceScope.launch {
             mediaSource.load()
         }
 
         // ExoPlayer will manage the MediaSession for us.
-        mediaSessionConnector = MediaSessionConnector(mediaSession).also { connector ->
-            // Produces DataSource instances through which media data is loaded.
-            val dataSourceFactory = DefaultDataSourceFactory(
-                this, Util.getUserAgent(this, UAMP_USER_AGENT), null
-            )
+        mediaSessionConnector = MediaSessionConnector(mediaSession)
+        mediaSessionConnector.setPlaybackPreparer(UampPlaybackPreparer())
+        mediaSessionConnector.setQueueNavigator(UampQueueNavigator(mediaSession))
 
-            // Create the PlaybackPreparer of the media session connector.
-            val playbackPreparer = UampPlaybackPreparer(
-                mediaSource,
-                exoPlayer,
-                dataSourceFactory
-            )
-
-            connector.setPlayer(exoPlayer)
-            connector.setPlaybackPreparer(playbackPreparer)
-            connector.setQueueNavigator(UampQueueNavigator(mediaSession))
-        }
+        switchToPlayer(
+            previousPlayer = null,
+            newPlayer = if (castPlayer?.isCastSessionAvailable == true) castPlayer!! else exoPlayer
+        )
+        notificationManager.showNotificationForPlayer(currentPlayer)
 
         packageValidator = PackageValidator(this, R.xml.allowed_media_browser_callers)
+
+        storage = PersistentStorage.getInstance(applicationContext)
     }
 
     /**
-     * This is the code that causes UAMP to stop playing when swiping it away from recents.
-     * The choice to do this is app specific. Some apps stop playback, while others allow playback
-     * to continue and allow uses to stop it with the notification.
+     * This is the code that causes UAMP to stop playing when swiping the activity away from
+     * recents. The choice to do this is app specific. Some apps stop playback, while others allow
+     * playback to continue and allow users to stop it with the notification.
      */
     override fun onTaskRemoved(rootIntent: Intent) {
+        saveRecentSongToStorage()
         super.onTaskRemoved(rootIntent)
 
         /**
-         * By stopping playback, the player will transition to [Player.STATE_IDLE]. This will
-         * cause a state change in the MediaSession, and (most importantly) call
-         * [MediaControllerCallback.onPlaybackStateChanged]. Because the playback state will
-         * be reported as [PlaybackStateCompat.STATE_NONE], the service will first remove
-         * itself as a foreground service, and will then call [stopSelf].
+         * By stopping playback, the player will transition to [Player.STATE_IDLE] triggering
+         * [Player.EventListener.onPlayerStateChanged] to be called. This will cause the
+         * notification to be hidden and trigger
+         * [PlayerNotificationManager.NotificationListener.onNotificationCancelled] to be called.
+         * The service will then remove itself as a foreground service, and will call
+         * [stopSelf].
          */
-        exoPlayer.stop(true)
+        currentPlayer.stop(/* reset= */true)
     }
 
     override fun onDestroy() {
@@ -208,6 +254,10 @@ open class MusicService : MediaBrowserServiceCompat() {
 
         // Cancel coroutines when the service is going away.
         serviceJob.cancel()
+
+        // Free ExoPlayer resources.
+        exoPlayer.removeListener(playerListener)
+        exoPlayer.release()
     }
 
     /**
@@ -236,8 +286,13 @@ open class MusicService : MediaBrowserServiceCompat() {
         }
 
         return if (isKnownCaller) {
-            // The caller is allowed to browse, so return the root.
-            BrowserRoot(UAMP_BROWSABLE_ROOT, rootExtras)
+            /**
+             * By default return the browsable root. Treat the EXTRA_RECENT flag as a special case
+             * and return the recent root instead.
+             */
+            val isRecentRequest = rootHints?.getBoolean(EXTRA_RECENT) ?: false
+            val browserRootPath = if (isRecentRequest) UAMP_RECENT_ROOT else UAMP_BROWSABLE_ROOT
+            BrowserRoot(browserRootPath, rootExtras)
         } else {
             /**
              * Unknown caller. There are two main ways to handle this:
@@ -262,27 +317,34 @@ open class MusicService : MediaBrowserServiceCompat() {
         result: Result<List<MediaItem>>
     ) {
 
-        // If the media source is ready, the results will be set synchronously here.
-        val resultsSent = mediaSource.whenReady { successfullyInitialized ->
-            if (successfullyInitialized) {
-                val children = browseTree[parentMediaId]?.map { item ->
-                    MediaItem(item.description, item.flag)
+        /**
+         * If the caller requests the recent root, return the most recently played song.
+         */
+        if (parentMediaId == UAMP_RECENT_ROOT) {
+            result.sendResult(storage.loadRecentSong()?.let { song -> listOf(song) })
+        } else {
+            // If the media source is ready, the results will be set synchronously here.
+            val resultsSent = mediaSource.whenReady { successfullyInitialized ->
+                if (successfullyInitialized) {
+                    val children = browseTree[parentMediaId]?.map { item ->
+                        MediaItem(item.description, item.flag)
+                    }
+                    result.sendResult(children)
+                } else {
+                    mediaSession.sendSessionEvent(NETWORK_FAILURE, null)
+                    result.sendResult(null)
                 }
-                result.sendResult(children)
-            } else {
-                mediaSession.sendSessionEvent(NETWORK_FAILURE, null)
-                result.sendResult(null)
             }
-        }
 
-        // If the results are not ready, the service must "detach" the results before
-        // the method returns. After the source is ready, the lambda above will run,
-        // and the caller will be notified that the results are ready.
-        //
-        // See [MediaItemFragmentViewModel.subscriptionCallback] for how this is passed to the
-        // UI/displayed in the [RecyclerView].
-        if (!resultsSent) {
-            result.detach()
+            // If the results are not ready, the service must "detach" the results before
+            // the method returns. After the source is ready, the lambda above will run,
+            // and the caller will be notified that the results are ready.
+            //
+            // See [MediaItemFragmentViewModel.subscriptionCallback] for how this is passed to the
+            // UI/displayed in the [RecyclerView].
+            if (!resultsSent) {
+                result.detach()
+            }
         }
     }
 
@@ -311,152 +373,281 @@ open class MusicService : MediaBrowserServiceCompat() {
     }
 
     /**
-     * Removes the [NOW_PLAYING_NOTIFICATION] notification.
-     *
-     * Since `stopForeground(false)` was already called (see
-     * [MediaControllerCallback.onPlaybackStateChanged], it's possible to cancel the notification
-     * with `notificationManager.cancel(NOW_PLAYING_NOTIFICATION)` if minSdkVersion is >=
-     * [Build.VERSION_CODES.LOLLIPOP].
-     *
-     * Prior to [Build.VERSION_CODES.LOLLIPOP], notifications associated with a foreground
-     * service remained marked as "ongoing" even after calling [Service.stopForeground],
-     * and cannot be cancelled normally.
-     *
-     * Fortunately, it's possible to simply call [Service.stopForeground] a second time, this
-     * time with `true`. This won't change anything about the service's state, but will simply
-     * remove the notification.
+     * Load the supplied list of songs and the song to play into the current player.
      */
-    private fun removeNowPlayingNotification() {
-        stopForeground(true)
+    private fun preparePlaylist(
+        metadataList: List<MediaMetadataCompat>,
+        itemToPlay: MediaMetadataCompat?,
+        playWhenReady: Boolean,
+        playbackStartPositionMs: Long
+    ) {
+        // Since the playlist was probably based on some ordering (such as tracks
+        // on an album), find which window index to play first so that the song the
+        // user actually wants to hear plays first.
+        val initialWindowIndex = if (itemToPlay == null) 0 else metadataList.indexOf(itemToPlay)
+        currentPlaylistItems = metadataList
+
+        currentPlayer.playWhenReady = playWhenReady
+        currentPlayer.stop()
+        // Set playlist and prepare.
+        currentPlayer.setMediaItems(
+            metadataList.map { it.toMediaItem() }, initialWindowIndex, playbackStartPositionMs)
+        currentPlayer.prepare()
+    }
+
+    private fun switchToPlayer(previousPlayer: Player?, newPlayer: Player) {
+        if (previousPlayer == newPlayer) {
+            return
+        }
+        currentPlayer = newPlayer
+        if (previousPlayer != null) {
+            val playbackState = previousPlayer.playbackState
+            if (currentPlaylistItems.isEmpty()) {
+                // We are joining a playback session. Loading the session from the new player is
+                // not supported, so we stop playback.
+                currentPlayer.clearMediaItems()
+                currentPlayer.stop()
+            } else if (playbackState != Player.STATE_IDLE && playbackState != Player.STATE_ENDED) {
+                preparePlaylist(
+                    metadataList = currentPlaylistItems,
+                    itemToPlay = currentPlaylistItems[currentMediaItemIndex],
+                    playWhenReady = previousPlayer.playWhenReady,
+                    playbackStartPositionMs = previousPlayer.currentPosition
+                )
+            }
+        }
+        mediaSessionConnector.setPlayer(newPlayer)
+        previousPlayer?.stop(/* reset= */true)
+    }
+
+    private fun saveRecentSongToStorage() {
+
+        // Obtain the current song details *before* saving them on a separate thread, otherwise
+        // the current player may have been unloaded by the time the save routine runs.
+        if (currentPlaylistItems.isEmpty()) {
+            return
+        }
+        val description = currentPlaylistItems[currentMediaItemIndex].description
+        val position = currentPlayer.currentPosition
+
+        serviceScope.launch {
+            storage.saveRecentSong(
+                description,
+                position
+            )
+        }
+    }
+
+    private inner class UampCastSessionAvailabilityListener : SessionAvailabilityListener {
+
+        /**
+         * Called when a Cast session has started and the user wishes to control playback on a
+         * remote Cast receiver rather than play audio locally.
+         */
+        override fun onCastSessionAvailable() {
+            switchToPlayer(currentPlayer, castPlayer!!)
+        }
+
+        /**
+         * Called when a Cast session has ended and the user wishes to control playback locally.
+         */
+        override fun onCastSessionUnavailable() {
+            switchToPlayer(currentPlayer, exoPlayer)
+        }
+    }
+
+    private inner class UampQueueNavigator(
+        mediaSession: MediaSessionCompat
+    ) : TimelineQueueNavigator(mediaSession) {
+        override fun getMediaDescription(player: Player, windowIndex: Int): MediaDescriptionCompat {
+            if (windowIndex < currentPlaylistItems.size) {
+                return currentPlaylistItems[windowIndex].description
+            }
+            return MediaDescriptionCompat.Builder().build()
+        }
+    }
+
+    private inner class UampPlaybackPreparer : MediaSessionConnector.PlaybackPreparer {
+
+        /**
+         * UAMP supports preparing (and playing) from search, as well as media ID, so those
+         * capabilities are declared here.
+         *
+         * TODO: Add support for ACTION_PREPARE and ACTION_PLAY, which mean "prepare/play something".
+         */
+        override fun getSupportedPrepareActions(): Long =
+            PlaybackStateCompat.ACTION_PREPARE_FROM_MEDIA_ID or
+                    PlaybackStateCompat.ACTION_PLAY_FROM_MEDIA_ID or
+                    PlaybackStateCompat.ACTION_PREPARE_FROM_SEARCH or
+                    PlaybackStateCompat.ACTION_PLAY_FROM_SEARCH
+
+        override fun onPrepare(playWhenReady: Boolean) {
+            val recentSong = storage.loadRecentSong() ?: return
+            onPrepareFromMediaId(
+                recentSong.mediaId!!,
+                playWhenReady,
+                recentSong.description.extras
+            )
+        }
+
+        override fun onPrepareFromMediaId(
+            mediaId: String,
+            playWhenReady: Boolean,
+            extras: Bundle?
+        ) {
+            mediaSource.whenReady {
+                val itemToPlay: MediaMetadataCompat? = mediaSource.find { item ->
+                    item.id == mediaId
+                }
+                if (itemToPlay == null) {
+                    Log.w(TAG, "Content not found: MediaID=$mediaId")
+                    // TODO: Notify caller of the error.
+                } else {
+
+                    val playbackStartPositionMs =
+                        extras?.getLong(MEDIA_DESCRIPTION_EXTRAS_START_PLAYBACK_POSITION_MS, C.TIME_UNSET)
+                            ?: C.TIME_UNSET
+
+                    preparePlaylist(
+                        buildPlaylist(itemToPlay),
+                        itemToPlay,
+                        playWhenReady,
+                        playbackStartPositionMs
+                    )
+                }
+            }
+        }
+
+        /**
+         * This method is used by the Google Assistant to respond to requests such as:
+         * - Play Geisha from Wake Up on UAMP
+         * - Play electronic music on UAMP
+         * - Play music on UAMP
+         *
+         * For details on how search is handled, see [AbstractMusicSource.search].
+         */
+        override fun onPrepareFromSearch(query: String, playWhenReady: Boolean, extras: Bundle?) {
+            mediaSource.whenReady {
+                val metadataList = mediaSource.search(query, extras ?: Bundle.EMPTY)
+                if (metadataList.isNotEmpty()) {
+                    preparePlaylist(
+                        metadataList,
+                        metadataList[0],
+                        playWhenReady,
+                        playbackStartPositionMs = C.TIME_UNSET
+                    )
+                }
+            }
+        }
+
+        override fun onPrepareFromUri(uri: Uri, playWhenReady: Boolean, extras: Bundle?) = Unit
+
+        override fun onCommand(
+            player: Player,
+            command: String,
+            extras: Bundle?,
+            cb: ResultReceiver?
+        ) = false
+
+        /**
+         * Builds a playlist based on a [MediaMetadataCompat].
+         *
+         * TODO: Support building a playlist by artist, genre, etc...
+         *
+         * @param item Item to base the playlist on.
+         * @return a [List] of [MediaMetadataCompat] objects representing a playlist.
+         */
+        private fun buildPlaylist(item: MediaMetadataCompat): List<MediaMetadataCompat> =
+            mediaSource.filter { it.album == item.album }.sortedBy { it.trackNumber }
     }
 
     /**
-     * Class to receive callbacks about state changes to the [MediaSessionCompat]. In response
-     * to those callbacks, this class:
-     *
-     * - Build/update the service's notification.
-     * - Register/unregister a broadcast receiver for [AudioManager.ACTION_AUDIO_BECOMING_NOISY].
-     * - Calls [Service.startForeground] and [Service.stopForeground].
+     * Listen for notification events.
      */
-    private inner class MediaControllerCallback : MediaControllerCompat.Callback() {
-        override fun onMetadataChanged(metadata: MediaMetadataCompat?) {
-            mediaController.playbackState?.let { state ->
-                serviceScope.launch {
-                    updateNotification(state)
-                }
+    private inner class PlayerNotificationListener :
+        PlayerNotificationManager.NotificationListener {
+        override fun onNotificationPosted(
+            notificationId: Int,
+            notification: Notification,
+            ongoing: Boolean
+        ) {
+            if (ongoing && !isForegroundService) {
+                ContextCompat.startForegroundService(
+                    applicationContext,
+                    Intent(applicationContext, this@MusicService.javaClass)
+                )
+
+                startForeground(notificationId, notification)
+                isForegroundService = true
             }
         }
 
-        override fun onPlaybackStateChanged(state: PlaybackStateCompat?) {
-            state?.let { state ->
-                serviceScope.launch {
-                    updateNotification(state)
-                }
-            }
+        override fun onNotificationCancelled(notificationId: Int, dismissedByUser: Boolean) {
+            stopForeground(true)
+            isForegroundService = false
+            stopSelf()
         }
+    }
 
-        private suspend fun updateNotification(state: PlaybackStateCompat) {
-            val updatedState = state.state
+    /**
+     * Listen for events from ExoPlayer.
+     */
+    private inner class PlayerEventListener : Player.Listener {
 
-            // Skip building a notification when state is "none" and metadata is null.
-            val notification = if (mediaController.metadata != null
-                    && updatedState != PlaybackStateCompat.STATE_NONE) {
-                notificationBuilder.buildNotification(mediaSession.sessionToken)
-            } else {
-                null
-            }
+        override fun onPlayerStateChanged(playWhenReady: Boolean, playbackState: Int) {
+            when (playbackState) {
+                Player.STATE_BUFFERING,
+                Player.STATE_READY -> {
+                    notificationManager.showNotificationForPlayer(currentPlayer)
+                    if (playbackState == Player.STATE_READY) {
 
-            when (updatedState) {
-                PlaybackStateCompat.STATE_BUFFERING,
-                PlaybackStateCompat.STATE_PLAYING -> {
-                    becomingNoisyReceiver.register()
+                        // When playing/paused save the current media item in persistent
+                        // storage so that playback can be resumed between device reboots.
+                        // Search for "media resumption" for more information.
+                        saveRecentSongToStorage()
 
-                    /**
-                     * This may look strange, but the documentation for [Service.startForeground]
-                     * notes that "calling this method does *not* put the service in the started
-                     * state itself, even though the name sounds like it."
-                     */
-                    if (notification != null) {
-                        notificationManager.notify(NOW_PLAYING_NOTIFICATION, notification)
-
-                        if (!isForegroundService) {
-                            ContextCompat.startForegroundService(
-                                applicationContext,
-                                Intent(applicationContext, this@MusicService.javaClass)
-                            )
-                            startForeground(NOW_PLAYING_NOTIFICATION, notification)
-                            isForegroundService = true
+                        if (!playWhenReady) {
+                            // If playback is paused we remove the foreground state which allows the
+                            // notification to be dismissed. An alternative would be to provide a
+                            // "close" button in the notification which stops playback and clears
+                            // the notification.
+                            stopForeground(false)
+                            isForegroundService = false
                         }
                     }
                 }
                 else -> {
-                    becomingNoisyReceiver.unregister()
-
-                    if (isForegroundService) {
-                        stopForeground(false)
-                        isForegroundService = false
-
-                        // If playback has ended, also stop the service.
-                        if (updatedState == PlaybackStateCompat.STATE_NONE) {
-                            stopSelf()
-                        }
-
-                        if (notification != null) {
-                            notificationManager.notify(NOW_PLAYING_NOTIFICATION, notification)
-                        } else {
-                            removeNowPlayingNotification()
-                        }
-                    }
+                    notificationManager.hideNotification()
                 }
             }
         }
-    }
-}
 
-/**
- * Helper class to retrieve the the Metadata necessary for the ExoPlayer MediaSession connection
- * extension to call [MediaSessionCompat.setMetadata].
- */
-private class UampQueueNavigator(
-    mediaSession: MediaSessionCompat
-) : TimelineQueueNavigator(mediaSession) {
-    private val window = Timeline.Window()
-    override fun getMediaDescription(player: Player, windowIndex: Int): MediaDescriptionCompat =
-        player.currentTimeline
-            .getWindow(windowIndex, window, true).tag as MediaDescriptionCompat
-}
-
-/**
- * Helper class for listening for when headphones are unplugged (or the audio
- * will otherwise cause playback to become "noisy").
- */
-private class BecomingNoisyReceiver(
-    private val context: Context,
-    sessionToken: MediaSessionCompat.Token
-) : BroadcastReceiver() {
-
-    private val noisyIntentFilter = IntentFilter(AudioManager.ACTION_AUDIO_BECOMING_NOISY)
-    private val controller = MediaControllerCompat(context, sessionToken)
-
-    private var registered = false
-
-    fun register() {
-        if (!registered) {
-            context.registerReceiver(this, noisyIntentFilter)
-            registered = true
+        override fun onEvents(player: Player, events: Player.Events) {
+            if (events.contains(EVENT_POSITION_DISCONTINUITY)
+                || events.contains(EVENT_MEDIA_ITEM_TRANSITION)
+                || events.contains(EVENT_PLAY_WHEN_READY_CHANGED)) {
+                currentMediaItemIndex = if (currentPlaylistItems.isNotEmpty()) {
+                    constrainValue(
+                        player.currentMediaItemIndex,
+                        /* min= */ 0,
+                        /* max= */ currentPlaylistItems.size - 1
+                    )
+                } else 0
+            }
         }
-    }
 
-    fun unregister() {
-        if (registered) {
-            context.unregisterReceiver(this)
-            registered = false
-        }
-    }
-
-    override fun onReceive(context: Context, intent: Intent) {
-        if (intent.action == AudioManager.ACTION_AUDIO_BECOMING_NOISY) {
-            controller.transportControls.pause()
+        override fun onPlayerError(error: PlaybackException) {
+            var message = R.string.generic_error;
+            Log.e(TAG, "Player error: " + error.errorCodeName + " (" + error.errorCode + ")");
+            if (error.errorCode == PlaybackException.ERROR_CODE_IO_BAD_HTTP_STATUS
+                || error.errorCode == PlaybackException.ERROR_CODE_IO_FILE_NOT_FOUND) {
+                message = R.string.error_media_not_found;
+            }
+            Toast.makeText(
+                applicationContext,
+                message,
+                Toast.LENGTH_LONG
+            ).show()
         }
     }
 }
@@ -474,3 +665,7 @@ private const val CONTENT_STYLE_LIST = 1
 private const val CONTENT_STYLE_GRID = 2
 
 private const val UAMP_USER_AGENT = "uamp.next"
+
+val MEDIA_DESCRIPTION_EXTRAS_START_PLAYBACK_POSITION_MS = "playback_start_position_ms"
+
+private const val TAG = "MusicService"

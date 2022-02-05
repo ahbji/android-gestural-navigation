@@ -19,6 +19,7 @@ package com.example.android.uamp.media.extensions
 import android.net.Uri
 import java.net.URLEncoder
 import java.nio.charset.Charset
+import java.util.Locale
 
 /**
  * This file contains extension methods for the java.lang package.
@@ -28,13 +29,11 @@ import java.nio.charset.Charset
  * Helper method to check if a [String] contains another in a case insensitive way.
  */
 fun String?.containsCaseInsensitive(other: String?) =
-        if (this == null && other == null) {
-            true
-        } else if (this != null && other != null) {
-            toLowerCase().contains(other.toLowerCase())
-        } else {
-            false
-        }
+    if (this != null && other != null) {
+        toLowerCase(Locale.getDefault()).contains(other.toLowerCase(Locale.getDefault()))
+    } else {
+        this == other
+    }
 
 /**
  * Helper extension to URL encode a [String]. Returns an empty string when called on null.
